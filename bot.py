@@ -349,13 +349,10 @@ class PointView(View):
         bar = get_exp_bar(exp)
 
         embed = discord.Embed(
-            title="💸 BlackCat Wallet",
+            title="<a:blackheart26:1120400673528360980> **BlackCat Wallet** <a:blackheart26:1120400673528360980>",
             description=(
-                "━━━━━━━━━━━━━━━━━━\n"
-                "💳 **BLACKCAT WALLET SYSTEM**\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                "💸 กดปุ่มด้านล่างเพื่อเช็คแต้ม หรือแลกเงิน\n"
-                "🎁 ใช้ 8 แต้ม แลก 30 บาท ได้ทันที"
+                "<a:354100downarrow:1492618243184001186> กดปุ่มด้านล่างเพื่อเช็คแต้ม หรือแลกเงิน\n"
+                "<a:529977coin:1492631678462464040> ใช้ 8 แต้ม แลก 30 บาท ได้ทันที"
             ),
             color=0x8A2BE2
         )
