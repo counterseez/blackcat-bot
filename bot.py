@@ -1,83 +1,77 @@
 import os
+import asyncio
+import threading
+import atexit
+
 import discord
 from discord.ext import commands
 from discord.ui import Button, View, Modal, TextInput
-import sqlite3
-import threading
-import atexit
-from pathlib import Path
 import psycopg2
-DATABASE_URL = os.getenv("DATABASE_URL")
+
 
 # ===== ตั้งค่า =====
+TOKEN = os.getenv("DISCORD_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not TOKEN:
+    raise ValueError("ไม่พบ DISCORD_TOKEN")
+if not DATABASE_URL:
+    raise ValueError("ไม่พบ DATABASE_URL")
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ===== DATABASE (SQLite) =====
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "points.db"
-
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-cursor = conn.cursor()
+# ===== DATABASE (PostgreSQL) =====
+conn = psycopg2.connect(DATABASE_URL, sslmode="require")
 lock = threading.Lock()
 
-# ===== POINT TABLE =====
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS points (
-    user_id TEXT PRIMARY KEY,
-    points INTEGER NOT NULL DEFAULT 0
-)
-""")
 
-# ===== REDEEM LOG TABLE =====
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS redeem_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT NOT NULL,
-    points_used INTEGER NOT NULL,
-    reward_baht INTEGER NOT NULL,
-    status TEXT DEFAULT 'pending',
-    ticket_channel_id TEXT,
-    approved_by TEXT,
-    approved_at TEXT,
-    rejected_by TEXT,
-    rejected_at TEXT,
-    redeemed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-""")
+def run_query(query: str, params=None, fetchone=False, fetchall=False, commit=False):
+    with lock:
+        with conn.cursor() as cur:
+            cur.execute(query, params or ())
+            result = None
 
-conn.commit()
+            if fetchone:
+                result = cur.fetchone()
+            elif fetchall:
+                result = cur.fetchall()
 
-# 🔧 FIX COLUMN (กัน error)
-def fix_redeem_table():
-    cursor.execute("PRAGMA table_info(redeem_logs)")
-    columns = [col[1] for col in cursor.fetchall()]
+            if commit:
+                conn.commit()
 
-    if "ticket_channel_id" not in columns:
-        cursor.execute("ALTER TABLE redeem_logs ADD COLUMN ticket_channel_id TEXT")
-
-    if "status" not in columns:
-        cursor.execute("ALTER TABLE redeem_logs ADD COLUMN status TEXT DEFAULT 'pending'")
-
-    if "approved_by" not in columns:
-        cursor.execute("ALTER TABLE redeem_logs ADD COLUMN approved_by TEXT")
-
-    if "approved_at" not in columns:
-        cursor.execute("ALTER TABLE redeem_logs ADD COLUMN approved_at TEXT")
-
-    if "rejected_by" not in columns:
-        cursor.execute("ALTER TABLE redeem_logs ADD COLUMN rejected_by TEXT")
-
-    if "rejected_at" not in columns:
-        cursor.execute("ALTER TABLE redeem_logs ADD COLUMN rejected_at TEXT")
-
-    conn.commit()
-
-fix_redeem_table()
+            return result
 
 
-@atexit.register
+def init_db():
+    run_query("""
+        CREATE TABLE IF NOT EXISTS points (
+            user_id TEXT PRIMARY KEY,
+            points INTEGER NOT NULL DEFAULT 0
+        )
+    """, commit=True)
+
+    run_query("""
+        CREATE TABLE IF NOT EXISTS redeem_logs (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            points_used INTEGER NOT NULL,
+            reward_baht INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            ticket_channel_id TEXT,
+            approved_by TEXT,
+            approved_at TIMESTAMP,
+            rejected_by TEXT,
+            rejected_at TIMESTAMP,
+            redeemed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """, commit=True)
+
+
+init_db()
+
+
 @atexit.register
 def close_db():
     try:
@@ -87,6 +81,7 @@ def close_db():
         pass
 
 
+# ===== Utility =====
 def get_ticket_owner_id(channel_name: str):
     if channel_name.startswith("ticket-"):
         try:
@@ -97,9 +92,10 @@ def get_ticket_owner_id(channel_name: str):
 
 
 def get_rank(user_id):
-    with lock:
-        cursor.execute("SELECT user_id, points FROM points ORDER BY points DESC, user_id ASC")
-        data = cursor.fetchall()
+    data = run_query(
+        "SELECT user_id, points FROM points ORDER BY points DESC, user_id ASC",
+        fetchall=True
+    ) or []
 
     for index, (uid, pts) in enumerate(data, start=1):
         if str(user_id) == uid:
@@ -123,123 +119,99 @@ def get_exp_bar(exp):
 def add_point(user_id, amount):
     user_id = str(user_id)
 
-    with lock:
-        cursor.execute("SELECT points FROM points WHERE user_id = ?", (user_id,))
-        result = cursor.fetchone()
-
-        if result is None:
-            cursor.execute(
-                "INSERT INTO points (user_id, points) VALUES (?, ?)",
-                (user_id, amount)
-            )
-        else:
-            new_points = result[0] + amount
-            cursor.execute(
-                "UPDATE points SET points = ? WHERE user_id = ?",
-                (new_points, user_id)
-            )
-
-        conn.commit()
+    run_query("""
+        INSERT INTO points (user_id, points)
+        VALUES (%s, %s)
+        ON CONFLICT (user_id)
+        DO UPDATE SET points = points.points + EXCLUDED.points
+    """, (user_id, amount), commit=True)
 
 
 def check_point(user_id):
     user_id = str(user_id)
 
-    with lock:
-        cursor.execute("SELECT points FROM points WHERE user_id = ?", (user_id,))
-        result = cursor.fetchone()
+    result = run_query(
+        "SELECT points FROM points WHERE user_id = %s",
+        (user_id,),
+        fetchone=True
+    )
 
     if result is None:
         return 0
     return result[0]
 
-from datetime import datetime
 
 def remove_point(user_id, amount):
     user_id = str(user_id)
+    current_points = check_point(user_id)
 
-    with lock:
-        cursor.execute("SELECT points FROM points WHERE user_id = ?", (user_id,))
-        result = cursor.fetchone()
+    if current_points < amount:
+        return False, current_points
 
-        if result is None:
-            return False, 0
+    new_points = current_points - amount
 
-        current_points = result[0]
-
-        if current_points < amount:
-            return False, current_points
-
-        new_points = current_points - amount
-
-        cursor.execute(
-            "UPDATE points SET points = ? WHERE user_id = ?",
-            (new_points, user_id)
-        )
-        conn.commit()
+    run_query(
+        "UPDATE points SET points = %s WHERE user_id = %s",
+        (new_points, user_id),
+        commit=True
+    )
 
     return True, new_points
 
 
+# ===== ระบบแลกแต้ม =====
 def add_redeem_log(user_id, points_used, reward_baht):
     user_id = str(user_id)
 
-    with lock:
-        cursor.execute("""
-            INSERT INTO redeem_logs (user_id, points_used, reward_baht)
-            VALUES (?, ?, ?)
-        """, (user_id, points_used, reward_baht))
-        conn.commit()
-        return cursor.lastrowid
+    result = run_query("""
+        INSERT INTO redeem_logs (user_id, points_used, reward_baht)
+        VALUES (%s, %s, %s)
+        RETURNING id
+    """, (user_id, points_used, reward_baht), fetchone=True, commit=True)
+
+    return result[0]
 
 
 def set_redeem_ticket(log_id, channel_id):
-    with lock:
-        cursor.execute("""
-            UPDATE redeem_logs
-            SET ticket_channel_id = ?
-            WHERE id = ?
-        """, (str(channel_id), log_id))
-        conn.commit()
+    run_query("""
+        UPDATE redeem_logs
+        SET ticket_channel_id = %s
+        WHERE id = %s
+    """, (str(channel_id), log_id), commit=True)
 
 
 def approve_redeem(log_id, admin_id):
-    with lock:
-        cursor.execute("""
-            UPDATE redeem_logs
-            SET status = 'approved',
-                approved_by = ?,
-                approved_at = ?
-            WHERE id = ?
-        """, (str(admin_id), datetime.now().isoformat(), log_id))
-        conn.commit()
+    run_query("""
+        UPDATE redeem_logs
+        SET status = 'approved',
+            approved_by = %s,
+            approved_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+    """, (str(admin_id), log_id), commit=True)
 
 
 def reject_redeem(log_id, admin_id):
-    with lock:
-        cursor.execute("""
-            UPDATE redeem_logs
-            SET status = 'rejected',
-                rejected_by = ?,
-                rejected_at = ?
-            WHERE id = ?
-        """, (str(admin_id), datetime.now().isoformat(), log_id))
-        conn.commit()
+    run_query("""
+        UPDATE redeem_logs
+        SET status = 'rejected',
+            rejected_by = %s,
+            rejected_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+    """, (str(admin_id), log_id), commit=True)
 
 
 def get_user_redeem_logs(user_id, limit=10):
     user_id = str(user_id)
 
-    with lock:
-        cursor.execute("""
-            SELECT points_used, reward_baht, redeemed_at
-            FROM redeem_logs
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-        """, (user_id, limit))
-        return cursor.fetchall()
-    
+    return run_query("""
+        SELECT points_used, reward_baht, redeemed_at
+        FROM redeem_logs
+        WHERE user_id = %s
+        ORDER BY id DESC
+        LIMIT %s
+    """, (user_id, limit), fetchall=True) or []
+
+
 async def process_redeem(interaction, required_points, reward):
     user = interaction.user
     guild = interaction.guild
@@ -309,7 +281,7 @@ async def process_redeem(interaction, required_points, reward):
     set_redeem_ticket(log_id, channel.id)
 
     embed = discord.Embed(
-        title="<a:529977coin:1492631678462464040> **คำขอแลกเงิน** <a:529977coin:1492631678462464040>",
+        title="🎁 คำขอแลกเงิน",
         description=(
             f"{user.mention} ใช้ **{required_points} แต้ม** แลก **{reward} บาท**\n\n"
             f"💰 แต้มคงเหลือ: **{new_points} แต้ม**\n"
@@ -317,7 +289,11 @@ async def process_redeem(interaction, required_points, reward):
         ),
         color=0x8A2BE2
     )
-
+    embed.add_field(
+        name="📌 สถานะ",
+        value="รอแอดมินตรวจสอบและยืนยันการจ่ายเงิน",
+        inline=False
+    )
     embed.set_footer(text="BlackCat Store 🐾")
 
     await channel.send(
@@ -330,10 +306,9 @@ async def process_redeem(interaction, required_points, reward):
         f"✅ เปิด Ticket แล้ว: {channel.mention}",
         ephemeral=True
     )
-    
-    
 
-# ===== ปุ่มเช็คแต้ม =====
+
+# ===== Views =====
 class PointView(View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -351,10 +326,13 @@ class PointView(View):
         bar = get_exp_bar(exp)
 
         embed = discord.Embed(
-            title="<a:blackheart26:1120400673528360980> **BlackCat Wallet** <a:blackheart26:1120400673528360980>",
+            title="💸 BlackCat Wallet",
             description=(
-                "<a:354100downarrow:1492618243184001186> กดปุ่มด้านล่างเพื่อเช็คแต้ม หรือแลกเงิน\n"
-                "<a:529977coin:1492631678462464040> ใช้ 8 แต้ม แลก 30 บาท ได้ทันที"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "💳 **BLACKCAT WALLET SYSTEM**\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "💸 กดปุ่มด้านล่างเพื่อเช็คแต้ม หรือแลกเงิน\n"
+                "🎁 ใช้ 8 แต้ม แลก 30 บาท ได้ทันที"
             ),
             color=0x8A2BE2
         )
@@ -372,26 +350,30 @@ class PointView(View):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(
-            label="💸 แลกแต้ม", 
-            style=discord.ButtonStyle.blurple,
-            custom_id="open_redeem_btn"
+        label="💸 แลกแต้ม",
+        style=discord.ButtonStyle.blurple,
+        custom_id="open_redeem_btn"
     )
     async def open_redeem(self, interaction: discord.Interaction, button: Button):
-
         embed = discord.Embed(
-            title="<a:4484pinkarrow:1120379420704780348> ระบบแลกแต้ม",
-            description= "เลือกจำนวนแต้มที่ต้องการ",
+            title="🎁 ระบบแลกแต้ม",
+            description=(
+                "━━━━━━━━━━━━━━━━━━\n"
+                "💸 **เลือกจำนวนแต้มที่ต้องการ**\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "🎁 8 แต้ม = 30 บาท\n"
+                "🎁 16 แต้ม = 60 บาท"
+            ),
             color=0x8A2BE2
-    )
+        )
 
         await interaction.response.send_message(
             embed=embed,
             view=RedeemMenuView(),
             ephemeral=True
-    )
+        )
 
- 
-# ===== ปิด Ticket =====
+
 class CloseTicketView(View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -409,43 +391,47 @@ class CloseTicketView(View):
         await interaction.response.send_message("🔒 ปิด Ticket แล้ว", ephemeral=True)
         await interaction.channel.delete()
 
+
 class RedeemTicketAdminView(View):
     def __init__(self, user_id: int, log_id: int):
         super().__init__(timeout=None)
         self.user_id = user_id
         self.log_id = log_id
 
-    @discord.ui.button(label="✅ ยืนยันจ่ายแล้ว", style=discord.ButtonStyle.green)
+    @discord.ui.button(
+        label="✅ ยืนยันจ่ายแล้ว",
+        style=discord.ButtonStyle.green,
+        custom_id="redeem_approve_btn"
+    )
     async def approve_btn(self, interaction: discord.Interaction, button: Button):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ แอดเท่านั้น", ephemeral=True)
             return
 
         approve_redeem(self.log_id, interaction.user.id)
-
         pts = check_point(self.user_id)
 
         embed = discord.Embed(
             title="🎉 แลกสำเร็จ",
             description=(
-                f"💸 <@{self.user_id}> ได้รับเงินแล้ว\n\n"
+                f"💸 <@{self.user_id}> ได้รับเงินเรียบร้อยแล้ว\n\n"
                 f"💰 แต้มคงเหลือ: **{pts} แต้ม**"
             ),
             color=0x57F287
-         )
+        )
+        embed.set_footer(text="BlackCat Store 🐾")
 
         await interaction.response.send_message("✅ ยืนยันเรียบร้อย")
+        await interaction.channel.send(content=f"<@{self.user_id}>", embed=embed)
 
-        await interaction.channel.send(
-            content=f"<@{self.user_id}>",
-            embed=embed
-        )
-
-        import asyncio
         await asyncio.sleep(5)
         await interaction.channel.delete()
 
-    @discord.ui.button(label="❌ ปฏิเสธ", style=discord.ButtonStyle.red)
+    @discord.ui.button(
+        label="❌ ปฏิเสธ",
+        style=discord.ButtonStyle.red,
+        custom_id="redeem_reject_btn"
+    )
     async def reject_btn(self, interaction: discord.Interaction, button: Button):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ แอดเท่านั้น", ephemeral=True)
@@ -455,8 +441,10 @@ class RedeemTicketAdminView(View):
 
         await interaction.response.send_message("❌ ปฏิเสธแล้ว")
         await interaction.channel.send(f"❌ <@{self.user_id}> รายการถูกปฏิเสธ")
+        await asyncio.sleep(5)
+        await interaction.channel.delete()
 
-# ===== VerifyView =====
+
 class VerifyView(View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -485,42 +473,22 @@ class VerifyView(View):
 
         try:
             await user.add_roles(role, reason="Verified by button")
-            await interaction.response.send_message("✅ ยืนยันตัวตนสำเร็จ ยินดีต้อนรับเข้าสู่เซิร์ฟเวอร์ 💜", ephemeral=True)
+            await interaction.response.send_message(
+                "✅ ยืนยันตัวตนสำเร็จ ยินดีต้อนรับเข้าสู่เซิร์ฟเวอร์ 💜",
+                ephemeral=True
+            )
         except discord.Forbidden:
             await interaction.response.send_message("❌ บอทไม่มีสิทธิ์ให้ยศนี้", ephemeral=True)
         except discord.HTTPException:
             await interaction.response.send_message("❌ เกิดข้อผิดพลาดในการให้ยศ", ephemeral=True)
 
 
-@bot.command()
-async def verifypanel(ctx):
-    if not ctx.author.guild_permissions.administrator:
-        await ctx.send("❌ ใช้ได้เฉพาะแอดมิน")
-        return
-
-    embed = discord.Embed(
-        title="✅ ระบบยืนยันตัวตน",
-        description="กดปุ่มด้านล่างเพื่อรับยศยืนยันตัวตน",
-        color=0x57F287
-    )
-    embed.add_field(
-        name="📌 หมายเหตุ",
-        value="เมื่อกดยืนยันแล้ว คุณจะสามารถเข้าถึงห้องที่กำหนดไว้ได้",
-        inline=False
-    )
-    embed.set_footer(text="BlackCat Verify System")
-
-    await ctx.send(embed=embed, view=VerifyView())
-
-
-
-
 class RedeemMenuView(View):
     def __init__(self):
-        super().__init__(timeout=60)  # อันนี้ไม่ต้อง persistent
+        super().__init__(timeout=60)
 
     @discord.ui.button(
-        label=" 📥 8 แต้ม = 30 บาท",
+        label="🎁 8 แต้ม = 30 บาท",
         style=discord.ButtonStyle.green,
         custom_id="redeem_8_btn"
     )
@@ -528,14 +496,14 @@ class RedeemMenuView(View):
         await process_redeem(interaction, 8, 30)
 
     @discord.ui.button(
-        label="📥 16 แต้ม = 60 บาท",
+        label="🎁 16 แต้ม = 60 บาท",
         style=discord.ButtonStyle.green,
         custom_id="redeem_16_btn"
     )
     async def redeem_16(self, interaction: discord.Interaction, button: Button):
         await process_redeem(interaction, 16, 60)
 
-# ===== Modal ใส่แต้ม =====
+
 class TopupModal(Modal, title="ใส่จำนวนแต้ม"):
     amount = TextInput(
         label="จำนวนแต้ม",
@@ -577,13 +545,11 @@ class TopupModal(Modal, title="ใส่จำนวนแต้ม"):
         )
 
 
-# ===== ปุ่มแอด =====
 class AdminConfirmView(View):
     def __init__(self, user_id: int):
         super().__init__(timeout=600)
         self.user_id = user_id
 
-    # ✅ ยืนยัน
     @discord.ui.button(label="✅ ยืนยันสลิป", style=discord.ButtonStyle.green)
     async def confirm(self, interaction: discord.Interaction, button: Button):
         if not interaction.user.guild_permissions.administrator:
@@ -592,7 +558,6 @@ class AdminConfirmView(View):
 
         await interaction.response.send_modal(TopupModal(self.user_id))
 
-    # ❌ สลิปผิด
     @discord.ui.button(label="❌ สลิปผิด", style=discord.ButtonStyle.red)
     async def reject(self, interaction: discord.Interaction, button: Button):
         if not interaction.user.guild_permissions.administrator:
@@ -600,19 +565,11 @@ class AdminConfirmView(View):
             return
 
         await interaction.response.send_message("❌ ปฏิเสธสลิปแล้ว", ephemeral=True)
-
         await interaction.channel.send(
             f"❌ <@{self.user_id}> สลิปไม่ถูกต้อง กรุณาส่งใหม่"
-            
-        )
-        await message.channel.send(
-            "📸 **ตรวจสอบสลิปด้านล่าง**\n\n"
-            "✅ ยืนยัน = เติมแต้ม\n"
-            "❌ สลิปผิด = ให้ส่งใหม่",
-        view=AdminConfirmView(owner_id)
         )
 
-# ===== หน้าร้าน =====
+
 class StoreView(View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -621,8 +578,7 @@ class StoreView(View):
         label="💵『 เติมเงิน 』",
         style=discord.ButtonStyle.green,
         custom_id="store_topup_btn"
-)
-    
+    )
     async def topup(self, interaction: discord.Interaction, button: Button):
         guild = interaction.guild
         user = interaction.user
@@ -670,6 +626,7 @@ class StoreView(View):
 
         embed.set_image(url="https://i.ibb.co/k6vBJ0Z9/004999020995030-20250502-202557.webp")
         await channel.send(content=user.mention, embed=embed)
+
 
 class TicketPanelView(View):
     def __init__(self):
@@ -729,7 +686,10 @@ class TicketPanelView(View):
         embed.set_footer(text="BlackCat Store 🐾")
 
         await channel.send(embed=embed, view=CloseTicketView())
-        await interaction.response.send_message(f"✅ เปิด Ticket เรียบร้อย: {channel.mention}", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ เปิด Ticket เรียบร้อย: {channel.mention}",
+            ephemeral=True
+        )
 
     @discord.ui.button(
         label="🚨 แจ้งปัญหา",
@@ -785,9 +745,13 @@ class TicketPanelView(View):
         embed.set_footer(text="BlackCat Store 🐾")
 
         await channel.send(embed=embed, view=CloseTicketView())
-        await interaction.response.send_message(f"✅ เปิด Ticket เรียบร้อย: {channel.mention}", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ เปิด Ticket เรียบร้อย: {channel.mention}",
+            ephemeral=True
+        )
 
-# ===== รับสลิป =====
+
+# ===== Events =====
 @bot.event
 async def on_message(message):
     if message.author.bot:
@@ -806,17 +770,18 @@ async def on_message(message):
     await bot.process_commands(message)
 
 
-# ===== คำสั่ง =====
+# ===== Commands =====
 @bot.command()
-async def  point(ctx):
+async def point(ctx):
     embed = discord.Embed(
         title="<a:blackheart26:1120400673528360980> **BLACKCAT WALLET SYSTEM** <a:blackheart26:1120400673528360980>",
-        description= 
-    "❰ <a:529977coin:1492631678462464040> ❱ POINT BALANCE \n\n"
-    "❰ <:630034mythic:1492631620514091259> ❱ RANK SYSTEM\n\n"
-    "❰ <:114361playing:1492631641896779886> ❱ LEVEL PROGRESS\n\n"
-    "❰ <a:25801:1492632503947624488> ❱ อัปเดตแบบเรียลไทม์ \n\n"
-    "❰ <a:dbdailybox:1120400738150002728> ❱ แลกรางวัลได้ทันที",
+        description=(
+            "❰ <a:529977coin:1492631678462464040> ❱ POINT BALANCE \n\n"
+            "❰ <:630034mythic:1492631620514091259> ❱ RANK SYSTEM\n\n"
+            "❰ <:114361playing:1492631641896779886> ❱ LEVEL PROGRESS\n\n"
+            "❰ <a:25801:1492632503947624488> ❱ อัปเดตแบบเรียลไทม์ \n\n"
+            "❰ <a:dbdailybox:1120400738150002728> ❱ แลกรางวัลได้ทันที"
+        ),
         color=0x8A2BE2
     )
     embed.set_image(url="https://cdn.discordapp.com/attachments/1000452582092845177/1492635264961745076/check_point_ss.gif?ex=69dc0c6a&is=69dabaea&hm=31ca158831b507cb7bf87cc6b3b503658d8337ada8fbc7425d3031f54e2873bd&")
@@ -848,9 +813,10 @@ async def ร้าน(ctx):
 
 @bot.command()
 async def top(ctx):
-    with lock:
-        cursor.execute("SELECT user_id, points FROM points ORDER BY points DESC, user_id ASC LIMIT 10")
-        data = cursor.fetchall()
+    data = run_query(
+        "SELECT user_id, points FROM points ORDER BY points DESC, user_id ASC LIMIT 10",
+        fetchall=True
+    ) or []
 
     embed = discord.Embed(title="🏆 อันดับแต้มสูงสุด", color=0xFFD700)
 
@@ -867,78 +833,64 @@ async def top(ctx):
 
 @bot.command()
 async def addpoint(ctx, member: discord.Member, amount: int):
-    # เช็คว่าเป็นแอดมินไหม
     if not ctx.author.guild_permissions.administrator:
         await ctx.send("❌ ใช้ได้เฉพาะแอดมิน")
         return
 
-    # เช็คจำนวนแต้ม
     if amount <= 0:
         await ctx.send("❌ จำนวนแต้มต้องมากกว่า 0")
         return
 
-    # เพิ่มแต้ม
     add_point(member.id, amount)
     pts = check_point(member.id)
 
     embed = discord.Embed(
         title="💸 เติมแต้มสำเร็จ",
         description=f"เพิ่ม {amount} แต้มให้ {member.mention}",
-        color=0x00ff99
+        color=0x00FF99
     )
-
-    embed.add_field(
-        name="💰 แต้มรวม",
-        value=f"```{pts} แต้ม```",
-        inline=False
-    )
+    embed.add_field(name="💰 แต้มรวม", value=f"```{pts} แต้ม```", inline=False)
 
     await ctx.send(embed=embed)
+
 
 @addpoint.error
 async def addpoint_error(ctx, error):
     await ctx.send("❌ ใช้คำสั่งแบบนี้: !addpoint @user จำนวนแต้ม")
 
+
 @bot.command()
 async def removepoint(ctx, member: discord.Member, amount: int):
-    # เช็คแอดมิน
     if not ctx.author.guild_permissions.administrator:
         await ctx.send("❌ ใช้ได้เฉพาะแอดมิน")
         return
 
-    # เช็คจำนวน
     if amount <= 0:
         await ctx.send("❌ จำนวนแต้มต้องมากกว่า 0")
         return
 
-    # เช็คแต้มปัจจุบัน
     current = check_point(member.id)
 
-    # กันติดลบ
     if amount > current:
         amount = current
 
-    # ลดแต้ม (ใช้ add_point ติดลบ)
     add_point(member.id, -amount)
     pts = check_point(member.id)
 
     embed = discord.Embed(
         title="💸 ลดแต้มสำเร็จ",
         description=f"ลด {amount} แต้มจาก {member.mention}",
-        color=0xff4444
+        color=0xFF4444
     )
-
-    embed.add_field(
-        name="💰 แต้มคงเหลือ",
-        value=f"```{pts} แต้ม```",
-        inline=False
-    )
+    embed.add_field(name="💰 แต้มคงเหลือ", value=f"```{pts} แต้ม```", inline=False)
 
     await ctx.send(embed=embed)
+
 
 @removepoint.error
 async def removepoint_error(ctx, error):
     await ctx.send("❌ ใช้คำสั่งแบบนี้: !removepoint @user จำนวนแต้ม")
+
 
 @bot.command()
 async def verify(ctx):
@@ -978,6 +930,7 @@ async def verify(ctx):
 
     await ctx.send(embed=embed, view=VerifyView())
 
+
 @bot.command()
 async def panel(ctx):
     if not ctx.author.guild_permissions.administrator:
@@ -995,12 +948,11 @@ async def panel(ctx):
         color=0x5B2D91
     )
 
-    
-
     embed.set_image(url="https://i.ibb.co/Jw9XtQqt/ticket-ss.gif")
     embed.set_footer(text="BlackCat Store • Ticket Panel")
 
     await ctx.send(embed=embed, view=TicketPanelView())
+
 
 @bot.command()
 async def redeempanel(ctx):
@@ -1023,6 +975,7 @@ async def redeempanel(ctx):
     embed.set_footer(text="BlackCat Store 🐾")
 
     await ctx.send(embed=embed, view=RedeemMenuView())
+
 
 @bot.command()
 async def redeemhistory(ctx):
@@ -1049,6 +1002,10 @@ async def redeemhistory(ctx):
     await ctx.send(embed=embed)
 
 
+@bot.command()
+async def backup(ctx):
+    await ctx.send("ระบบนี้ย้ายไปใช้ PostgreSQL แล้ว ไม่ต้องสำรอง points.db แล้ว ✅")
+
 
 # ===== ออนไลน์ =====
 @bot.event
@@ -1059,16 +1016,9 @@ async def on_ready():
         bot.add_view(StoreView())
         bot.add_view(VerifyView())
         bot.add_view(TicketPanelView())
-
         bot.persistent_views_added = True
 
     print(f"บอทออนไลน์: {bot.user}")
 
-# ===== TOKEN =====
-
-TOKEN = os.getenv("DISCORD_TOKEN")
-
-if not TOKEN:
-    raise ValueError("ไม่พบ DISCORD_TOKEN")
 
 bot.run(TOKEN)
