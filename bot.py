@@ -1049,6 +1049,9 @@ async def redeemhistory(ctx):
     embed.set_footer(text="BlackCat Store 🐾")
     await ctx.send(embed=embed)
 
+@bot.command()
+async def test(ctx):
+    await ctx.send("ทำงานแล้ว!")
 
 # ===== ออนไลน์ =====
 @bot.event
