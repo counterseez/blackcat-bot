@@ -380,8 +380,8 @@ class PointView(View):
     async def open_redeem(self, interaction: discord.Interaction, button: Button):
 
         embed = discord.Embed(
-            title="🎁 ระบบแลกแต้ม",
-            description="เลือกจำนวนแต้มที่ต้องการ",
+            title="<a:4484pinkarrow:1120379420704780348> ระบบแลกแต้ม",
+            description= "เลือกจำนวนแต้มที่ต้องการ",
             color=0x8A2BE2
     )
 
