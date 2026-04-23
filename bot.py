@@ -6,6 +6,8 @@ import sqlite3
 import threading
 import atexit
 from pathlib import Path
+import psycopg2
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # ===== ตั้งค่า =====
 intents = discord.Intents.default()
