@@ -307,7 +307,7 @@ async def process_redeem(interaction, required_points, reward):
     set_redeem_ticket(log_id, channel.id)
 
     embed = discord.Embed(
-        title="🎁 คำขอแลกเงิน",
+        title="<a:529977coin:1492631678462464040> **คำขอแลกเงิน** <a:529977coin:1492631678462464040>",
         description=(
             f"{user.mention} ใช้ **{required_points} แต้ม** แลก **{reward} บาท**\n\n"
             f"💰 แต้มคงเหลือ: **{new_points} แต้ม**\n"
