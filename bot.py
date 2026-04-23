@@ -521,7 +521,7 @@ class RedeemMenuView(View):
         super().__init__(timeout=60)  # อันนี้ไม่ต้อง persistent
 
     @discord.ui.button(
-        label=" <a:529977coin:1492631678462464040> 8 แต้ม = 30 บาท",
+        label=" 📥 8 แต้ม = 30 บาท",
         style=discord.ButtonStyle.green,
         custom_id="redeem_8_btn"
     )
@@ -529,7 +529,7 @@ class RedeemMenuView(View):
         await process_redeem(interaction, 8, 30)
 
     @discord.ui.button(
-        label="<a:529977coin:1492631678462464040> 16 แต้ม = 60 บาท",
+        label="📥 16 แต้ม = 60 บาท",
         style=discord.ButtonStyle.green,
         custom_id="redeem_16_btn"
     )
