@@ -7,9 +7,13 @@ import discord
 from discord.ext import commands
 from discord.ui import Button, View, Modal, TextInput
 import psycopg2
-
+from dotenv import load_dotenv
+import aiohttp
+from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont
 
 # ===== ตั้งค่า =====
+load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -23,26 +27,35 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ===== DATABASE (PostgreSQL) =====
-conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+try:
+    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+    print("✅ เชื่อมต่อฐานข้อมูลสำเร็จ")
+except Exception as e:
+    print("❌ ต่อ DB ไม่ได้:", e)
+    conn = None
 lock = threading.Lock()
 
 
 def run_query(query: str, params=None, fetchone=False, fetchall=False, commit=False):
-    with lock:
-        with conn.cursor() as cur:
-            cur.execute(query, params or ())
-            result = None
+    try:
+        with lock:
+            with conn.cursor() as cur:
+                cur.execute(query, params or ())
+                result = None
 
-            if fetchone:
-                result = cur.fetchone()
-            elif fetchall:
-                result = cur.fetchall()
+                if fetchone:
+                    result = cur.fetchone()
+                elif fetchall:
+                    result = cur.fetchall()
 
-            if commit:
-                conn.commit()
+                if commit:
+                    conn.commit()
 
-            return result
+                return result
 
+    except Exception as e:
+        print("❌ DB ERROR:", e)
+        return None
 
 def init_db():
     run_query("""
@@ -67,6 +80,14 @@ def init_db():
             redeemed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
     """, commit=True)
+
+    run_query("""
+    CREATE TABLE IF NOT EXISTS toplive_config (
+        id INTEGER PRIMARY KEY DEFAULT 1,
+        channel_id TEXT,
+        message_id TEXT
+    )
+""", commit=True)
 
 
 init_db()
@@ -143,20 +164,21 @@ def check_point(user_id):
 
 def remove_point(user_id, amount):
     user_id = str(user_id)
-    current_points = check_point(user_id)
 
-    if current_points < amount:
-        return False, current_points
+    run_query("""
+        INSERT INTO points (user_id, points)
+        VALUES (%s, 0)
+        ON CONFLICT (user_id)
+        DO NOTHING
+    """, (user_id,), commit=True)
 
-    new_points = current_points - amount
+    run_query("""
+        UPDATE points
+        SET points = GREATEST(points - %s, 0)
+        WHERE user_id = %s
+    """, (amount, user_id), commit=True)
 
-    run_query(
-        "UPDATE points SET points = %s WHERE user_id = %s",
-        (new_points, user_id),
-        commit=True
-    )
-
-    return True, new_points
+    return True, check_point(user_id)
 
 
 # ===== ระบบแลกแต้ม =====
@@ -281,7 +303,7 @@ async def process_redeem(interaction, required_points, reward):
     set_redeem_ticket(log_id, channel.id)
 
     embed = discord.Embed(
-        title="🎁 คำขอแลกเงิน",
+        title="<a:529977coin:1492631678462464040> คำขอแลกเงิน",
         description=(
             f"{user.mention} ใช้ **{required_points} แต้ม** แลก **{reward} บาท**\n\n"
             f"💰 แต้มคงเหลือ: **{new_points} แต้ม**\n"
@@ -326,13 +348,9 @@ class PointView(View):
         bar = get_exp_bar(exp)
 
         embed = discord.Embed(
-            title="💸 BlackCat Wallet",
+            title=" <a:blackheart26:1120400673528360980> **BlackCat Wallet** <a:blackheart26:1120400673528360980>",
             description=(
-                "━━━━━━━━━━━━━━━━━━\n"
-                "💳 **BLACKCAT WALLET SYSTEM**\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                "💸 กดปุ่มด้านล่างเพื่อเช็คแต้ม หรือแลกเงิน\n"
-                "🎁 ใช้ 8 แต้ม แลก 30 บาท ได้ทันที"
+                "<a:529977coin:1492631678462464040> ใช้ 20 แต้ม แลก 30 บาท ได้ทันที <a:25801:1492632503947624488> "
             ),
             color=0x8A2BE2
         )
@@ -344,7 +362,7 @@ class PointView(View):
         embed.add_field(name="🏆 อันดับ", value=f"```#{rank}```", inline=True)
         embed.add_field(name="🎮 เลเวล", value=f"```Lv.{level}```", inline=True)
         embed.add_field(name="📊 ความคืบหน้า", value=f"```{bar} ({exp}/100)```", inline=False)
-        embed.add_field(name="🎁 สิทธิพิเศษ", value="```ใช้ 8 แต้ม แลก 30 บาท```", inline=False)
+        embed.add_field(name="🎁 สิทธิพิเศษ", value="```ใช้ 20 แต้ม แลก 30 บาท```", inline=False)
 
         embed.set_footer(text="BlackCat Store 🐾")
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -356,13 +374,9 @@ class PointView(View):
     )
     async def open_redeem(self, interaction: discord.Interaction, button: Button):
         embed = discord.Embed(
-            title="🎁 ระบบแลกแต้ม",
+            title=" <a:529977coin:1492631678462464040> ระบบแลกแต้ม",
             description=(
-                "━━━━━━━━━━━━━━━━━━\n"
-                "💸 **เลือกจำนวนแต้มที่ต้องการ**\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                "🎁 8 แต้ม = 30 บาท\n"
-                "🎁 16 แต้ม = 60 บาท"
+                 "<a:hellheartspinred:1120400786099273778> เลือกจำนวนแต้มที่ต้องการ <a:heart:1120400770689413242>"
             ),
             color=0x8A2BE2
         )
@@ -412,7 +426,7 @@ class RedeemTicketAdminView(View):
         pts = check_point(self.user_id)
 
         embed = discord.Embed(
-            title="🎉 แลกสำเร็จ",
+            title="<a:9182galaxystar2:1120385283880407050> แลกสำเร็จ",
             description=(
                 f"💸 <@{self.user_id}> ได้รับเงินเรียบร้อยแล้ว\n\n"
                 f"💰 แต้มคงเหลือ: **{pts} แต้ม**"
@@ -423,9 +437,7 @@ class RedeemTicketAdminView(View):
 
         await interaction.response.send_message("✅ ยืนยันเรียบร้อย")
         await interaction.channel.send(content=f"<@{self.user_id}>", embed=embed)
-
-        await asyncio.sleep(5)
-        await interaction.channel.delete()
+        await interaction.channel.send(view=CloseTicketView())
 
     @discord.ui.button(
         label="❌ ปฏิเสธ",
@@ -441,8 +453,7 @@ class RedeemTicketAdminView(View):
 
         await interaction.response.send_message("❌ ปฏิเสธแล้ว")
         await interaction.channel.send(f"❌ <@{self.user_id}> รายการถูกปฏิเสธ")
-        await asyncio.sleep(5)
-        await interaction.channel.delete()
+        await interaction.channel.send("🔒 ให้แอดมินกดปุ่มด้านล่างเพื่อปิดห้อง", view=CloseTicketView())
 
 
 class VerifyView(View):
@@ -485,23 +496,23 @@ class VerifyView(View):
 
 class RedeemMenuView(View):
     def __init__(self):
-        super().__init__(timeout=60)
+        super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="🎁 8 แต้ม = 30 บาท",
+        label="📥 20 แต้ม = 30 บาท",
         style=discord.ButtonStyle.green,
         custom_id="redeem_8_btn"
     )
-    async def redeem_8(self, interaction: discord.Interaction, button: Button):
-        await process_redeem(interaction, 8, 30)
+    async def redeem_20(self, interaction: discord.Interaction, button: Button):
+        await process_redeem(interaction, 20, 30)
 
     @discord.ui.button(
-        label="🎁 16 แต้ม = 60 บาท",
+        label="📥 40 แต้ม = 60 บาท",
         style=discord.ButtonStyle.green,
         custom_id="redeem_16_btn"
     )
     async def redeem_16(self, interaction: discord.Interaction, button: Button):
-        await process_redeem(interaction, 16, 60)
+        await process_redeem(interaction, 40, 60)
 
 
 class TopupModal(Modal, title="ใส่จำนวนแต้ม"):
@@ -540,7 +551,8 @@ class TopupModal(Modal, title="ใส่จำนวนแต้ม"):
         )
 
         await interaction.channel.send(
-            f"💸 <@{self.user_id}> ได้รับ {amount} แต้ม (รวม {pts})",
+            f"<a:6544_heartarrow_purple:1120400637763518664> <@{self.user_id}> ได้รับ {amount} แต้ม (รวม {pts})\n "
+            f" เช็คแต้มเพิ่มเติม <a:4484pinkarrow:1120379420704780348> <#1491479318331785368>",
             view=CloseTicketView()
         )
 
@@ -780,7 +792,8 @@ async def point(ctx):
             "❰ <:630034mythic:1492631620514091259> ❱ RANK SYSTEM\n\n"
             "❰ <:114361playing:1492631641896779886> ❱ LEVEL PROGRESS\n\n"
             "❰ <a:25801:1492632503947624488> ❱ อัปเดตแบบเรียลไทม์ \n\n"
-            "❰ <a:dbdailybox:1120400738150002728> ❱ แลกรางวัลได้ทันที"
+            "❰ <a:dbdailybox:1120400738150002728> ❱ แลกรางวัลได้ทันที\n\n"
+            "<a:354100downarrow:1492618243184001186> กดปุ่มเช็คแต้ม หรือแลกเงิน <a:354100downarrow:1492618243184001186>"
         ),
         color=0x8A2BE2
     )
@@ -811,24 +824,282 @@ async def ร้าน(ctx):
     await ctx.send(embed=embed, view=StoreView())
 
 
-@bot.command()
-async def top(ctx):
+async def download_image(url: str):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                return Image.open(BytesIO(await resp.read())).convert("RGBA")
+    return None
+
+
+def circle_crop(img: Image.Image, size=(170, 170)):
+    img = img.resize(size)
+
+    mask = Image.new("L", size, 0)
+    draw = ImageDraw.Draw(mask)
+    draw.ellipse((0, 0, size[0], size[1]), fill=255)
+
+    output = Image.new("RGBA", size, (0, 0, 0, 0))
+    output.paste(img, (0, 0), mask)
+    return output
+
+import re
+
+def clean_text(text):
+    # ลบแค่ emoji / symbol แปลก ๆ
+    text = re.sub(r"[^\u0E00-\u0E7Fa-zA-Z0-9\s._-]", "", text)
+    return text.strip()
+
+async def create_top3_image(top3_data):
+    width, height = 1200, 420
+    canvas = Image.new("RGBA", (width, height), (28, 12, 48, 255))
+    draw = ImageDraw.Draw(canvas)
+
+    # กรอบ
+    draw.rounded_rectangle(
+        (15, 15, width - 15, height - 15),
+        radius=25,
+        fill=(40, 20, 70, 255),
+        outline=(140, 70, 220, 255),
+        width=3
+    )
+
+    # ฟอนต์
+    font_title = ImageFont.truetype("Kanit-Regular.ttf", 34)
+    font_top = ImageFont.truetype("Kanit-Regular.ttf", 22)
+    font_name = ImageFont.truetype("Kanit-SemiBoldItalic.ttf", 24)
+    font_points = ImageFont.truetype("Kanit-Regular.ttf", 22)
+
+    draw.text((35, 28), "BLACKCAT TOP 3", font=font_title, fill=(255, 255, 255))
+
+    # ===== center จริง =====
+    avatar_size = 170
+    centers = [width // 4, width // 2, width * 3 // 4]
+
+    for i, (user, points) in enumerate(top3_data[:3]):
+        cx = centers[i]
+        y = 95
+
+        # TOP
+        label = f"TOP {i+1}"
+        lb = draw.textbbox((0, 0), label, font=font_top)
+        draw.text(
+            (int(cx - (lb[2]-lb[0]) / 2), 80),
+            label,
+            font=font_top,
+            fill=(245, 220, 130)
+        )
+
+        # รูป
+        avatar_url = user.avatar.url if user.avatar else user.default_avatar.url
+        avatar = await download_image(avatar_url)
+
+        avatar_y = y + 48
+        if avatar:
+            avatar = circle_crop(avatar, (avatar_size, avatar_size))
+            canvas.paste(
+                avatar,
+                (int(cx - avatar_size / 2), avatar_y),
+                avatar
+            )
+
+        # ชื่อ
+        name = clean_text(user.display_name)
+
+        # 🔥 ถ้าลบแล้วเหลือสั้นเกิน ใช้ชื่อจริงแทน
+        if len(name) < 2:
+            name = user.name
+
+        name = name[:14]
+
+        if not name:
+            name = clean_text(user.name)
+
+        if not name:
+            name = "Unknown"
+
+        name = name[:14]
+        name_y = avatar_y + 182
+
+        nb = draw.textbbox((0, 0), name, font=font_name)
+        draw.text(
+            (int(cx - (nb[2]-nb[0]) / 2), name_y),
+            name,
+            font=font_name,
+            fill=(255, 255, 255)
+        )
+
+        # แต้ม
+        pt = f"{points} แต้ม"
+        points_y = avatar_y + 218
+
+        pb = draw.textbbox((0, 0), pt, font=font_points)
+        draw.text(
+            (int(cx - (pb[2]-pb[0]) / 2), points_y),
+            pt,
+            font=font_points,
+            fill=(205, 170, 255)
+        )
+
+    output = BytesIO()
+    canvas.save(output, format="PNG")
+    output.seek(0)
+    return output
+
+
+# ===== สร้าง embed อันดับ =====
+async def build_top_embed():
     data = run_query(
         "SELECT user_id, points FROM points ORDER BY points DESC, user_id ASC LIMIT 10",
         fetchall=True
     ) or []
 
-    embed = discord.Embed(title="🏆 อันดับแต้มสูงสุด", color=0xFFD700)
+    embed = discord.Embed(
+        title="<a:blackheart26:1120400673528360980> **BlackCat Ranking** <a:blackheart26:1120400673528360980>",
+        description=(
+            "<a:529977coin:1492631678462464040> อันดับแต้มล่าสุดของเซิร์ฟเวอร์\n"
+            "<a:25801:1492632503947624488> ยิ่งแต้มเยอะ ยิ่งขึ้นอันดับ ⚡"
+        ),
+        color=0x8A2BE2
+    )
 
     if not data:
-        embed.description = "ยังไม่มีข้อมูล"
-    else:
-        lines = []
-        for i, (user_id, points) in enumerate(data, start=1):
-            lines.append(f"**#{i}** <@{user_id}> — `{points}` แต้ม")
-        embed.description = "\n".join(lines)
+        embed.set_image(url="https://cdn.discordapp.com/attachments/1000452582092845177/1492635264961745076/check_point_ss.gif")
+        embed.add_field(
+            name="🏆 อันดับ",
+            value="```yaml\nยังไม่มีข้อมูล\n```",
+            inline=False
+        )
+        embed.add_field(
+            name="🎁 สิทธิพิเศษ",
+            value="```yaml\nใช้ 20 แต้ม แลก 30 บาท\n```",
+            inline=False
+        )
+        embed.set_footer(text="BlackCat Store 🐾")
+        return embed, None
 
-    await ctx.send(embed=embed)
+    # เตรียมข้อมูล top 10
+    lines = []
+    medals = ["🥇", "🥈", "🥉"]
+
+    for i, (user_id, points) in enumerate(data, start=1):
+        user_id = int(user_id)
+
+        user = bot.get_user(user_id)
+        if user is None:
+            try:
+                user = await bot.fetch_user(user_id)
+            except:
+                user = None
+
+        name = user.display_name if user else f"User {user_id}"
+        icon = medals[i - 1] if i <= 3 else f"#{i}"
+        lines.append(f"{icon} {name} ┇ {points} แต้ม")
+
+    # เตรียม top 3 สำหรับสร้างรูป
+    top3_data = []
+    for user_id, points in data[:3]:
+        user_id = int(user_id)
+
+        user = bot.get_user(user_id)
+        if user is None:
+            try:
+                user = await bot.fetch_user(user_id)
+            except:
+                user = None
+
+        if user:
+            top3_data.append((user, points))
+
+    file = None
+    if top3_data:
+        img_bytes = await create_top3_image(top3_data)
+        file = discord.File(img_bytes, filename="top3.png")
+        embed.set_image(url="attachment://top3.png")
+    else:
+        embed.set_image(url="https://cdn.discordapp.com/attachments/1000452582092845177/1492635264961745076/check_point_ss.gif")
+
+    # ใช้รูปอันดับ 1 เป็น thumbnail
+    top_user_id = int(data[0][0])
+    top_user = bot.get_user(top_user_id)
+    if top_user is None:
+        try:
+            top_user = await bot.fetch_user(top_user_id)
+        except:
+            top_user = None
+
+    if top_user:
+        embed.set_thumbnail(
+            url=top_user.avatar.url if top_user.avatar else top_user.default_avatar.url
+        )
+
+    embed.add_field(
+        name="🏆 อันดับ",
+        value="```yaml\n" + "\n".join(lines) + "\n```",
+        inline=False
+    )
+
+    embed.add_field(
+        name="🎁 สิทธิพิเศษ",
+        value="```yaml\nใช้ 20 แต้ม แลก 30 บาท\n```",
+        inline=False
+    )
+
+    embed.set_footer(text="BlackCat Store 🐾")
+    return embed, file
+
+
+# ===== คำสั่งเดียว ใช้แทน !top =====
+@bot.command()
+async def toplive(ctx):
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("❌ แอดเท่านั้น")
+        return
+
+    embed, file = await build_top_embed()
+
+    if file:
+        msg = await ctx.send(embed=embed, file=file)
+    else:
+        msg = await ctx.send(embed=embed)
+
+    run_query("""
+        INSERT INTO toplive_config (id, channel_id, message_id)
+        VALUES (1, %s, %s)
+        ON CONFLICT (id)
+        DO UPDATE SET channel_id = EXCLUDED.channel_id,
+                      message_id = EXCLUDED.message_id
+    """, (str(ctx.channel.id), str(msg.id)), commit=True)
+
+    await ctx.send("✅ ตั้งค่าห้องสร้างแรงเรียบร้อย")
+
+async def toplive_loop():
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        config = run_query(
+            "SELECT channel_id, message_id FROM toplive_config WHERE id = 1",
+            fetchone=True
+        )
+
+        if config:
+            channel_id, message_id = config
+            channel = bot.get_channel(int(channel_id))
+
+            if channel:
+                try:
+                    msg = await channel.fetch_message(int(message_id))
+                    embed, file = await build_top_embed()
+
+                    if file:
+                        await msg.edit(embed=embed, attachments=[file])
+                    else:
+                        await msg.edit(embed=embed)
+
+                except Exception as e:
+                    print("❌ toplive update error:", e)
+
+        await asyncio.sleep(30)    
 
 
 @bot.command()
@@ -964,7 +1235,7 @@ async def redeempanel(ctx):
         title="🎁 ระบบแลกเงิน",
         description=(
             "━━━━━━━━━━━━━━━━━━\n"
-            "💸 **แลก 8 แต้ม รับทันที 30 บาท**\n"
+            "💸 **แลก 20 แต้ม รับทันที 30 บาท**\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
             "📌 สะสมแต้มให้ครบแล้วกดปุ่มด้านล่าง\n"
             "✅ แลกได้ไม่จำกัด ขอแค่แต้มพอ\n"
@@ -1010,15 +1281,16 @@ async def backup(ctx):
 # ===== ออนไลน์ =====
 @bot.event
 async def on_ready():
-    if not hasattr(bot, "persistent_views_added"):
-        bot.add_view(PointView())
-        bot.add_view(CloseTicketView())
-        bot.add_view(StoreView())
-        bot.add_view(VerifyView())
-        bot.add_view(TicketPanelView())
-        bot.persistent_views_added = True
+    bot.add_view(PointView())
+    bot.add_view(StoreView())
+    bot.add_view(TicketPanelView())
+    bot.add_view(VerifyView())
+    bot.add_view(CloseTicketView())
+    bot.add_view(RedeemMenuView())
 
-    print(f"บอทออนไลน์: {bot.user}")
+    print(f"บอทออนไลน์: {bot.user} (ID: {bot.user.id})")
+
+    bot.loop.create_task(toplive_loop())
 
 
 bot.run(TOKEN)
