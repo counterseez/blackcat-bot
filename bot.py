@@ -37,6 +37,10 @@ lock = threading.Lock()
 
 
 def run_query(query: str, params=None, fetchone=False, fetchall=False, commit=False):
+    if conn is None:
+        print("❌ ไม่มีการเชื่อมต่อ DB")
+        return None
+
     try:
         with lock:
             with conn.cursor() as cur:
@@ -87,6 +91,11 @@ def init_db():
         channel_id TEXT,
         message_id TEXT
     )
+""", commit=True)
+    
+    run_query("""
+    ALTER TABLE points
+    ADD COLUMN IF NOT EXISTS total_money INTEGER NOT NULL DEFAULT 0
 """, commit=True)
 
 
@@ -165,20 +174,17 @@ def check_point(user_id):
 def remove_point(user_id, amount):
     user_id = str(user_id)
 
-    run_query("""
-        INSERT INTO points (user_id, points)
-        VALUES (%s, 0)
-        ON CONFLICT (user_id)
-        DO NOTHING
-    """, (user_id,), commit=True)
-
-    run_query("""
+    result = run_query("""
         UPDATE points
-        SET points = GREATEST(points - %s, 0)
-        WHERE user_id = %s
-    """, (amount, user_id), commit=True)
+        SET points = points - %s
+        WHERE user_id = %s AND points >= %s
+        RETURNING points
+    """, (amount, user_id, amount), fetchone=True, commit=True)
 
-    return True, check_point(user_id)
+    if result is None:
+        return False, check_point(user_id)
+
+    return True, result[0]
 
 
 # ===== ระบบแลกแต้ม =====
@@ -201,25 +207,39 @@ def set_redeem_ticket(log_id, channel_id):
         WHERE id = %s
     """, (str(channel_id), log_id), commit=True)
 
+def get_redeem_status(log_id):
+    result = run_query(
+        "SELECT status FROM redeem_logs WHERE id = %s",
+        (log_id,),
+        fetchone=True
+    )
+
+    if result is None:
+        return None
+
+    return result[0]
+
 
 def approve_redeem(log_id, admin_id):
-    run_query("""
+    return run_query("""
         UPDATE redeem_logs
         SET status = 'approved',
             approved_by = %s,
             approved_at = CURRENT_TIMESTAMP
-        WHERE id = %s
-    """, (str(admin_id), log_id), commit=True)
+        WHERE id = %s AND status = 'pending'
+        RETURNING id
+    """, (str(admin_id), log_id), fetchone=True, commit=True)
 
 
 def reject_redeem(log_id, admin_id):
-    run_query("""
+    return run_query("""
         UPDATE redeem_logs
         SET status = 'rejected',
             rejected_by = %s,
             rejected_at = CURRENT_TIMESTAMP
-        WHERE id = %s
-    """, (str(admin_id), log_id), commit=True)
+        WHERE id = %s AND status = 'pending'
+        RETURNING id
+    """, (str(admin_id), log_id), fetchone=True, commit=True)
 
 
 def get_user_redeem_logs(user_id, limit=10):
@@ -235,30 +255,32 @@ def get_user_redeem_logs(user_id, limit=10):
 
 
 async def process_redeem(interaction, required_points, reward):
+    await interaction.response.defer(ephemeral=True)
+
     user = interaction.user
     guild = interaction.guild
 
     pts = check_point(user.id)
 
     if guild is None:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌ ใช้ได้เฉพาะในเซิร์ฟเวอร์",
             ephemeral=True
         )
         return
 
     if pts < required_points:
-        await interaction.response.send_message(
-            f"❌ แต้มไม่พอ\nตอนนี้มี {pts} แต้ม\nต้องใช้ {required_points} แต้ม",
-            ephemeral=True
-        )
+        await interaction.followup.send(
+        f"❌ แต้มไม่พอ ตอนนี้มี {pts} แต้ม ต้องใช้ {required_points} แต้ม",
+        ephemeral=True
+    )
         return
 
     success, new_points = remove_point(user.id, required_points)
 
     if not success:
-        await interaction.response.send_message(
-            "❌ แลกไม่สำเร็จ",
+        await interaction.followup.send(
+            "❌ แลกไม่สำเร็จ แต้มไม่พอ หรือมีการกดแลกซ้ำเร็วเกินไป",
             ephemeral=True
         )
         return
@@ -324,7 +346,7 @@ async def process_redeem(interaction, required_points, reward):
         view=RedeemTicketAdminView(user.id, log_id)
     )
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ เปิด Ticket แล้ว: {channel.mention}",
         ephemeral=True
     )
@@ -422,7 +444,24 @@ class RedeemTicketAdminView(View):
             await interaction.response.send_message("❌ แอดเท่านั้น", ephemeral=True)
             return
 
-        approve_redeem(self.log_id, interaction.user.id)
+        result = approve_redeem(self.log_id, interaction.user.id)
+
+        if result is None:
+            status = get_redeem_status(self.log_id)
+            await interaction.response.send_message(
+                f"❌ รายการนี้ถูกดำเนินการไปแล้ว สถานะ: {status}",
+                ephemeral=True
+            )
+            return
+
+        run_query("""
+            UPDATE points
+            SET total_money = total_money + (
+            SELECT reward_baht FROM redeem_logs WHERE id = %s
+            )
+            WHERE user_id = %s
+        """, (self.log_id, str(self.user_id)), commit=True)
+
         pts = check_point(self.user_id)
 
         embed = discord.Embed(
@@ -449,9 +488,28 @@ class RedeemTicketAdminView(View):
             await interaction.response.send_message("❌ แอดเท่านั้น", ephemeral=True)
             return
 
-        reject_redeem(self.log_id, interaction.user.id)
+        result = reject_redeem(self.log_id, interaction.user.id)
 
-        await interaction.response.send_message("❌ ปฏิเสธแล้ว")
+        if result is None:
+            status = get_redeem_status(self.log_id)
+            await interaction.response.send_message(
+                f"❌ รายการนี้ถูกดำเนินการไปแล้ว สถานะ: {status}",
+                ephemeral=True
+            )
+            return
+
+            # คืนแต้มให้ลูกค้า
+        run_query("""
+            UPDATE points
+            SET points = points + (
+            SELECT points_used FROM redeem_logs WHERE id = %s
+            )
+            WHERE user_id = %s
+        """, (self.log_id, str(self.user_id)), commit=True)
+
+        await interaction.response.send_message("❌ ปฏิเสธแล้ว และคืนแต้มให้ลูกค้าเรียบร้อย")
+        
+        
         await interaction.channel.send(f"❌ <@{self.user_id}> รายการถูกปฏิเสธ")
         await interaction.channel.send("🔒 ให้แอดมินกดปุ่มด้านล่างเพื่อปิดห้อง", view=CloseTicketView())
 
@@ -929,8 +987,8 @@ async def create_top3_image(top3_data):
             fill=(255, 255, 255)
         )
 
-        # แต้ม
-        pt = f"{points} แต้ม"
+        # บาท
+        pt = f"{points} บาท"
         points_y = avatar_y + 218
 
         pb = draw.textbbox((0, 0), pt, font=font_points)
@@ -950,15 +1008,15 @@ async def create_top3_image(top3_data):
 # ===== สร้าง embed อันดับ =====
 async def build_top_embed():
     data = run_query(
-        "SELECT user_id, points FROM points ORDER BY points DESC, user_id ASC LIMIT 10",
+        "SELECT user_id, total_money FROM points ORDER BY total_money DESC, user_id ASC LIMIT 10",
         fetchall=True
     ) or []
 
     embed = discord.Embed(
         title="<a:blackheart26:1120400673528360980> **BlackCat Ranking** <a:blackheart26:1120400673528360980>",
         description=(
-            "<a:529977coin:1492631678462464040> อันดับแต้มล่าสุดของเซิร์ฟเวอร์\n"
-            "<a:25801:1492632503947624488> ยิ่งแต้มเยอะ ยิ่งขึ้นอันดับ ⚡"
+            "<a:529977coin:1492631678462464040> อันดับแลกเงินสูงสุดของเซิร์ฟเวอร์\n"
+            "<a:25801:1492632503947624488> ยิ่งแลกเยอะ ยิ่งได้เยอะ ⚡"
         ),
         color=0x8A2BE2
     )
@@ -971,7 +1029,7 @@ async def build_top_embed():
             inline=False
         )
         embed.add_field(
-            name="🎁 สิทธิพิเศษ",
+            name=" 🎁 สิทธิพิเศษ",
             value="```yaml\nใช้ 20 แต้ม แลก 30 บาท\n```",
             inline=False
         )
@@ -994,7 +1052,7 @@ async def build_top_embed():
 
         name = user.display_name if user else f"User {user_id}"
         icon = medals[i - 1] if i <= 3 else f"#{i}"
-        lines.append(f"{icon} {name} ┇ {points} แต้ม")
+        lines.append(f"{icon} {name} ┇ {points} บาท")
 
     # เตรียม top 3 สำหรับสร้างรูป
     top3_data = []
@@ -1040,7 +1098,7 @@ async def build_top_embed():
     )
 
     embed.add_field(
-        name="🎁 สิทธิพิเศษ",
+        name="💵 แลกเงิน",
         value="```yaml\nใช้ 20 แต้ม แลก 30 บาท\n```",
         inline=False
     )
@@ -1071,8 +1129,7 @@ async def toplive(ctx):
                       message_id = EXCLUDED.message_id
     """, (str(ctx.channel.id), str(msg.id)), commit=True)
 
-    await ctx.send("✅ ตั้งค่าห้องสร้างแรงเรียบร้อย")
-
+    
 async def toplive_loop():
     await bot.wait_until_ready()
 
@@ -1099,7 +1156,7 @@ async def toplive_loop():
                 except Exception as e:
                     print("❌ toplive update error:", e)
 
-        await asyncio.sleep(30)    
+        await asyncio.sleep(120)    
 
 
 @bot.command()
@@ -1290,7 +1347,8 @@ async def on_ready():
 
     print(f"บอทออนไลน์: {bot.user} (ID: {bot.user.id})")
 
-    bot.loop.create_task(toplive_loop())
+    if not hasattr(bot, "toplive_task"):
+        bot.toplive_task = bot.loop.create_task(toplive_loop())
 
 
 bot.run(TOKEN)
